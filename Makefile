@@ -1,7 +1,7 @@
 # Go parameters
-BINARY_NAME=go-project-template
+BINARY_NAME=go-migrate-gsm
 BINARY_UNIX=$(BINARY_NAME)_unix
-REPO=ghcr.io/dathan/go-project-template/go-project-template
+REPO=ghcr.io/dathan/go-migrate-gsm/go-migrate-gsm
 
 .PHONY: all
 all: lint test build
