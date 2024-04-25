@@ -2,41 +2,53 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	"log"
+	"strings"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
+	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	"github.com/sirupsen/logrus"
 	"google.golang.org/api/iterator"
-	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 )
 
 func main() {
+
+	sourceProjectID := flag.String("srcpid", "", "source project id")
+	destProjectID := flag.String("dstpid", "", "destination project id")
+	flag.Parse()
+
+	if len(*sourceProjectID) == 0 || len(*destProjectID) == 0 {
+		flag.Usage()
+		return
+	}
+
+	// build
 	ctx := context.Background()
 	client, err := secretmanager.NewClient(ctx)
 	if err != nil {
-		log.Fatalf("failed to setup client: %v", err)
+		logrus.Fatalf("failed to setup client: %v", err)
 	}
 	defer client.Close()
 
-	// Replace 'your-source-project-id' with your source Google Cloud Project ID
-	sourceProjectID := "your-source-project-id"
-	destProjectID := "your-destination-project-id"
-
 	// List all secrets in the source project
-	fmt.Println("Listing Secrets in source project:")
-	srcSecrets, err := listSecrets(ctx, client, sourceProjectID)
-	if err != nil {
-		log.Fatalf("failed to list secrets: %v", err)
+	logrus.Println("Listing Secrets in source project:")
+	srcSecrets, err := listSecrets(ctx, client, *sourceProjectID)
+	if err != nil || len(srcSecrets) == 0 {
+		logrus.Fatalf("failed to list secrets: %v", err)
 	}
-
-	// Assuming the user switches Google Cloud project authorization here
-	fmt.Println("Please switch your Google Cloud credentials now to access the destination project.")
 
 	// Create secrets in the destination project with the same names
 	for _, secret := range srcSecrets {
-		fmt.Printf("Creating secret %s in destination project\n", secret.Name)
-		if err := createSecret(ctx, client, destProjectID, secret.Name); err != nil {
-			log.Printf("failed to create secret: %v", err)
+		logrus.Printf("Creating secret %s in destination project", secret.Name)
+		var value string
+		if value, err = getSecretValue(ctx, client, *sourceProjectID, secret.Name); err != nil {
+			logrus.Errorf("failed to get secret valueL %v", err)
+			continue
+		}
+
+		if err := createSecretWithValue(ctx, client, *destProjectID, secret.Name, value, secret.Labels); err != nil {
+			logrus.Errorf("failed to create secret: %v", err)
 		}
 	}
 }
@@ -55,12 +67,100 @@ func listSecrets(ctx context.Context, client *secretmanager.Client, projectID st
 		if err != nil {
 			return nil, err
 		}
-		secrets = append(secrets, resp)
+
+		if strings.Contains(resp.Name, "psid_") {
+			logrus.Debugf("Adding secret %s from source project", resp.GetName())
+			secrets = append(secrets, resp)
+		}
 	}
 	return secrets, nil
 }
 
-func createSecret(ctx context.Context, client *secretmanager.Client, projectID, secretID string) error {
+func extractKeyFromPattern(s string) string {
+	// Split the string by the "/" delimiter
+	parts := strings.Split(s, "/")
+	// Check if the pattern is at least as long as expected
+	if len(parts) < 4 {
+		fmt.Println("Invalid string pattern")
+		return ""
+	}
+	// The key should be the last part of the pattern
+	key := parts[len(parts)-1]
+	return key
+}
+
+func getSecretValue(ctx context.Context, client *secretmanager.Client, projectID, secretID string) (string, error) {
+	secretID = extractKeyFromPattern(secretID)
+	// Build the access request
+	accessRequest := &secretmanagerpb.AccessSecretVersionRequest{
+		Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, secretID),
+	}
+
+	// Call the API to access the secret version
+	result, err := client.AccessSecretVersion(ctx, accessRequest)
+	if err != nil {
+		return "", err
+	}
+
+	// Data is returned as a byte slice, so convert it to a string
+	return string(result.Payload.Data), nil
+}
+
+func parseKeyName(secretID string) (string, error) {
+	secretID = extractKeyFromPattern(secretID)
+
+	logrus.Infof("making a create request for secretID: %s ", secretID)
+	if len(secretID) == 0 || len(secretID) > 255 {
+		return "", fmt.Errorf("Invalid secret: %s", secretID)
+	}
+	return secretID, nil
+}
+
+func createSecretWithValue(ctx context.Context, client *secretmanager.Client, projectID, secretID, value string, labels map[string]string) error {
+	parent := fmt.Sprintf("projects/%s", projectID)
+
+	secretID, err := parseKeyName(secretID)
+	if err != nil {
+		return err
+	}
+
+	// Create the secret
+	createReq := &secretmanagerpb.CreateSecretRequest{
+		Parent:   parent,
+		SecretId: secretID,
+		Secret: &secretmanagerpb.Secret{
+			Replication: &secretmanagerpb.Replication{
+				Replication: &secretmanagerpb.Replication_Automatic_{
+					Automatic: &secretmanagerpb.Replication_Automatic{},
+				},
+			},
+			Labels: labels,
+		},
+	}
+	_, err = client.CreateSecret(ctx, createReq)
+	if err != nil {
+		return err
+	}
+
+	// Add the secret version with the value
+	addSecretVersionReq := &secretmanagerpb.AddSecretVersionRequest{
+		Parent: fmt.Sprintf("%s/secrets/%s", parent, secretID),
+		Payload: &secretmanagerpb.SecretPayload{
+			Data: []byte(value),
+		},
+	}
+	_, err = client.AddSecretVersion(ctx, addSecretVersionReq)
+
+	return err
+}
+
+func createSecret(ctx context.Context, client *secretmanager.Client, projectID, sID string) error {
+	secretID, strErr := parseKeyName(sID)
+
+	if strErr != nil {
+		return strErr
+	}
+
 	req := &secretmanagerpb.CreateSecretRequest{
 		Parent:   fmt.Sprintf("projects/%s", projectID),
 		SecretId: secretID,
@@ -72,7 +172,8 @@ func createSecret(ctx context.Context, client *secretmanager.Client, projectID, 
 			},
 		},
 	}
+
+	return nil
 	_, err := client.CreateSecret(ctx, req)
 	return err
 }
-

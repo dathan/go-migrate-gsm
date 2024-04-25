@@ -1,18 +1,11 @@
 ## Purpose
 
-Build a template repository to get to coding as quickly as possible, by starting from a common template which follows the guidelines [`here`](https://github.com/golang-standards/project-layout)
+Read the secrets from one GCP account and copy the same secrets to a new GCP account. For instance moving keys from staging to prod.
 
 ## Features
-* Makefile to build consistently in a local environment and remote environment
-* Dockerfile for a generic image to build for 
-* Go Mod (which you should to your project path change)
-* VS Code environment
-* Generic docker push
+* Flags for src project id and dst project id
+
 
 ## TODO
-* Brew generic install [DONE]
-* GITHUB Actions build and push to dockerhub [DONE]
-* Production Builds with git tag
+* backup keys locally??
 
-## Installing via brew
-* `brew install --verbose --build-from-source brew/Formula/go-migrate-gsm.rb`
