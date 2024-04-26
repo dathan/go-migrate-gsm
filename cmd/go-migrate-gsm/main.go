@@ -14,10 +14,12 @@ import (
 
 func main() {
 
+	// gather src and dst and validate usage
 	sourceProjectID := flag.String("srcpid", "", "source project id")
 	destProjectID := flag.String("dstpid", "", "destination project id")
 	flag.Parse()
 
+	// both flags are required
 	if len(*sourceProjectID) == 0 || len(*destProjectID) == 0 {
 		flag.Usage()
 		return
@@ -117,6 +119,7 @@ func getSecretValue(ctx context.Context, client *secretmanager.Client, projectID
 
 func parseKeyName(secretID string) (string, error) {
 
+	// key will be rewritten for the new account
 	secretID = extractKeyFromPattern(secretID)
 	logrus.Debugf("making a create request for secretID: %s ", secretID)
 
