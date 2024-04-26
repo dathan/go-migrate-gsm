@@ -41,12 +41,15 @@ func main() {
 	// Create secrets in the destination project with the same names
 	for _, secret := range srcSecrets {
 		logrus.Printf("Creating secret %s in destination project", secret.Name)
+
+		// fetch the value
 		var value string
 		if value, err = getSecretValue(ctx, client, *sourceProjectID, secret.Name); err != nil {
 			logrus.Errorf("failed to get secret valueL %v", err)
 			continue
 		}
 
+		// create the secret
 		if err := createSecretWithValue(ctx, client, *destProjectID, secret.Name, value, secret.Labels); err != nil {
 			logrus.Errorf("failed to create secret: %v", err)
 		}
@@ -68,7 +71,7 @@ func listSecrets(ctx context.Context, client *secretmanager.Client, projectID st
 			return nil, err
 		}
 
-		if strings.Contains(resp.Name, "psid_") {
+		if strings.Contains(resp.Name, "psid_") { // TODO get a key pattern config in the future
 			logrus.Debugf("Adding secret %s from source project", resp.GetName())
 			secrets = append(secrets, resp)
 		}
@@ -81,7 +84,7 @@ func extractKeyFromPattern(s string) string {
 	parts := strings.Split(s, "/")
 	// Check if the pattern is at least as long as expected
 	if len(parts) < 4 {
-		fmt.Println("Invalid string pattern")
+		logrus.Errorf("key pattern is incorrect: %v", parts)
 		return ""
 	}
 	// The key should be the last part of the pattern
@@ -90,7 +93,13 @@ func extractKeyFromPattern(s string) string {
 }
 
 func getSecretValue(ctx context.Context, client *secretmanager.Client, projectID, secretID string) (string, error) {
-	secretID = extractKeyFromPattern(secretID)
+
+	// validate inputs and return the keyname
+	secretID, err := parseKeyName(secretID)
+	if err != nil {
+		return "", err
+	}
+
 	// Build the access request
 	accessRequest := &secretmanagerpb.AccessSecretVersionRequest{
 		Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, secretID),
@@ -107,12 +116,15 @@ func getSecretValue(ctx context.Context, client *secretmanager.Client, projectID
 }
 
 func parseKeyName(secretID string) (string, error) {
-	secretID = extractKeyFromPattern(secretID)
 
-	logrus.Infof("making a create request for secretID: %s ", secretID)
+	secretID = extractKeyFromPattern(secretID)
+	logrus.Debugf("making a create request for secretID: %s ", secretID)
+
+	// the spec is validated since the pkg does not
 	if len(secretID) == 0 || len(secretID) > 255 {
 		return "", fmt.Errorf("Invalid secret: %s", secretID)
 	}
+
 	return secretID, nil
 }
 
@@ -144,36 +156,12 @@ func createSecretWithValue(ctx context.Context, client *secretmanager.Client, pr
 
 	// Add the secret version with the value
 	addSecretVersionReq := &secretmanagerpb.AddSecretVersionRequest{
-		Parent: fmt.Sprintf("%s/secrets/%s", parent, secretID),
+		Parent: fmt.Sprintf("%s/secrets/%s", parent, secretID), // notice how secretID is rewritten here
 		Payload: &secretmanagerpb.SecretPayload{
 			Data: []byte(value),
 		},
 	}
 	_, err = client.AddSecretVersion(ctx, addSecretVersionReq)
 
-	return err
-}
-
-func createSecret(ctx context.Context, client *secretmanager.Client, projectID, sID string) error {
-	secretID, strErr := parseKeyName(sID)
-
-	if strErr != nil {
-		return strErr
-	}
-
-	req := &secretmanagerpb.CreateSecretRequest{
-		Parent:   fmt.Sprintf("projects/%s", projectID),
-		SecretId: secretID,
-		Secret: &secretmanagerpb.Secret{
-			Replication: &secretmanagerpb.Replication{
-				Replication: &secretmanagerpb.Replication_Automatic_{
-					Automatic: &secretmanagerpb.Replication_Automatic{},
-				},
-			},
-		},
-	}
-
-	return nil
-	_, err := client.CreateSecret(ctx, req)
 	return err
 }
