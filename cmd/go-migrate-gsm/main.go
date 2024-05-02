@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
+	"sync"
 
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
@@ -17,6 +21,8 @@ func main() {
 	// gather src and dst and validate usage
 	sourceProjectID := flag.String("srcpid", "", "source project id")
 	destProjectID := flag.String("dstpid", "", "destination project id")
+	deleteSrc := flag.Bool("delete", false, "backup and delete all the keys and values")
+
 	flag.Parse()
 
 	// both flags are required
@@ -33,32 +39,123 @@ func main() {
 	}
 	defer client.Close()
 
+	logrus.Info("Reading in ignore list of psids")
+	// build an ignore list there could be keys we do not want to move
+	mapofIds := loadIgnoreMap()
+
 	// List all secrets in the source project
 	logrus.Println("Listing Secrets in source project:")
-	srcSecrets, err := listSecrets(ctx, client, *sourceProjectID)
+	srcSecrets, err := listSecrets(ctx, client, *sourceProjectID, mapofIds)
 	if err != nil || len(srcSecrets) == 0 {
 		logrus.Fatalf("failed to list secrets: %v", err)
 	}
 
+	// add concurrency but limit it to 5 threads
+	semaphore := make(chan struct{}, 5)
+	wg := &sync.WaitGroup{}
+
 	// Create secrets in the destination project with the same names
 	for _, secret := range srcSecrets {
 		logrus.Printf("Creating secret %s in destination project", secret.Name)
+		wg.Add(1)
+		semaphore <- struct{}{} // fill the channel and block
+		go func(ctx context.Context, client *secretmanager.Client, secret *secretmanagerpb.Secret) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // consume the channel at the function return and unblock
+			// fetch the value
+			var value string
+			if value, err = getSecretValue(ctx, client, *sourceProjectID, secret.Name); err != nil {
+				logrus.Errorf("failed to get secret valueL %v", err)
+				return
+			}
 
-		// fetch the value
-		var value string
-		if value, err = getSecretValue(ctx, client, *sourceProjectID, secret.Name); err != nil {
-			logrus.Errorf("failed to get secret valueL %v", err)
-			continue
-		}
+			// backup and delete the secret
+			if *deleteSrc == true {
+				if err := deleteSecret(client, *sourceProjectID, secret.Name, value, secret.Labels); err != nil {
+					logrus.Errorf("cannot delete the secret %s == Error: %s", secret.Name, err.Error())
+				}
+				return
+			}
 
-		// create the secret
-		if err := createSecretWithValue(ctx, client, *destProjectID, secret.Name, value, secret.Labels); err != nil {
-			logrus.Errorf("failed to create secret: %v", err)
-		}
+			// create the secret
+			if err := createSecretWithValue(ctx, client, *destProjectID, secret.Name, value, secret.Labels); err != nil {
+				logrus.Errorf("failed to create secret: %v", err)
+			}
+		}(ctx, client, secret)
 	}
+	wg.Wait()
 }
 
-func listSecrets(ctx context.Context, client *secretmanager.Client, projectID string) ([]*secretmanagerpb.Secret, error) {
+type JsonItem struct {
+	SecretID  string            `json:"secretID"`
+	SecretKey string            `json:"secretKey"`
+	Value     string            `json:"value"`
+	Labels    map[string]string `json:"labels"`
+}
+
+func deleteSecret(client *secretmanager.Client, projectID, secretID, value string, labels map[string]string) error {
+	secretKey := extractKeyFromPattern(secretID)
+	fileName := "backup/" + secretKey + ".json"
+	file, err := os.Create(fileName)
+	if err != nil {
+		return err
+	}
+
+	defer file.Close()
+
+	jsonit := &JsonItem{
+		SecretID:  secretID,
+		SecretKey: secretKey,
+		Value:     value,
+		Labels:    labels,
+	}
+
+	jsonEnc, err := json.MarshalIndent(jsonit, "", "\t")
+	if err != nil {
+		return err
+	}
+
+	_, err = file.Write(jsonEnc)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func loadIgnoreMap() map[string]bool {
+
+	// Create a map to store each line with true value
+	lineMap := make(map[string]bool)
+
+	filePath := "ignore.psids"
+	os.Open(filePath)
+	file, err := os.Open(filePath)
+
+	if err != nil {
+		fmt.Println("Error opening file:", err)
+		return lineMap
+	}
+	defer file.Close() // Ensure the file is closed after reading
+
+	// Create a scanner to read the file
+	scanner := bufio.NewScanner(file)
+
+	// Read the file line by line
+	for scanner.Scan() {
+		line := strings.ToLower(scanner.Text()) // the data stored in gsm is lower to test against
+		lineMap[line] = true                    // Store the line as key and true as value
+	}
+
+	// Check for errors during Scan. End of file is expected and not reported by Scan as an error.
+	if err := scanner.Err(); err != nil {
+		logrus.Errorln("Error reading from file:", err)
+		return lineMap
+	}
+
+	return lineMap
+}
+func listSecrets(ctx context.Context, client *secretmanager.Client, projectID string, ignoreMap map[string]bool) ([]*secretmanagerpb.Secret, error) {
 	var secrets []*secretmanagerpb.Secret
 	req := &secretmanagerpb.ListSecretsRequest{
 		Parent: fmt.Sprintf("projects/%s", projectID),
@@ -74,8 +171,14 @@ func listSecrets(ctx context.Context, client *secretmanager.Client, projectID st
 		}
 
 		if strings.Contains(resp.Name, "psid_") { // TODO get a key pattern config in the future
-			logrus.Debugf("Adding secret %s from source project", resp.GetName())
-			secrets = append(secrets, resp)
+			keyName := extractKeyFromPattern(resp.Name)
+			keyName = strings.ToLower(strings.Replace(keyName, "psid_", "", 1))
+			if _, ok := ignoreMap[keyName]; !ok {
+				//logrus.Infof("Adding secret %s from source project: Keyname: %s not found in map", resp.GetName(), keyName)
+				secrets = append(secrets, resp)
+			} else {
+				logrus.Warnf("Skipping %s its a staging node", resp.Name)
+			}
 		}
 	}
 	return secrets, nil
