@@ -56,7 +56,7 @@ func main() {
 
 	// Create secrets in the destination project with the same names
 	for _, secret := range srcSecrets {
-		logrus.Printf("Creating secret %s in destination project", secret.Name)
+		logrus.Printf("Looking at secret %s in destination project", secret.Name)
 		wg.Add(1)
 		semaphore <- struct{}{} // fill the channel and block
 		go func(ctx context.Context, client *secretmanager.Client, secret *secretmanagerpb.Secret) {
@@ -71,7 +71,7 @@ func main() {
 
 			// backup and delete the secret
 			if *deleteSrc == true {
-				if err := deleteSecret(client, *sourceProjectID, secret.Name, value, secret.Labels); err != nil {
+				if err := deleteSecret(ctx, client, *sourceProjectID, *destProjectID, secret.Name, value, secret.Labels); err != nil {
 					logrus.Errorf("cannot delete the secret %s == Error: %s", secret.Name, err.Error())
 				}
 				return
@@ -93,7 +93,7 @@ type JsonItem struct {
 	Labels    map[string]string `json:"labels"`
 }
 
-func deleteSecret(client *secretmanager.Client, projectID, secretID, value string, labels map[string]string) error {
+func deleteSecret(ctx context.Context, client *secretmanager.Client, srcprojectID, projectID, secretID, value string, labels map[string]string) error {
 	secretKey := extractKeyFromPattern(secretID)
 	fileName := "backup/" + secretKey + ".json"
 	file, err := os.Create(fileName)
@@ -110,6 +110,18 @@ func deleteSecret(client *secretmanager.Client, projectID, secretID, value strin
 		Labels:    labels,
 	}
 
+	// check the value and do not delete if it is missing
+	var valueDst string
+	if valueDst, err = getSecretValue(ctx, client, projectID, secretID); err != nil {
+		logrus.Errorf("failed to get secret valueL %v", err)
+		return err
+	}
+
+	// do not delete if the value is empty or does not exist
+	if value != valueDst {
+		return fmt.Errorf("Value doesn't eixst %s", value)
+	}
+
 	jsonEnc, err := json.MarshalIndent(jsonit, "", "\t")
 	if err != nil {
 		return err
@@ -118,6 +130,16 @@ func deleteSecret(client *secretmanager.Client, projectID, secretID, value strin
 	_, err = file.Write(jsonEnc)
 	if err != nil {
 		return err
+	}
+
+	// Build the request to delete the secret.
+	deleteReq := &secretmanagerpb.DeleteSecretRequest{
+		Name: secretID,
+	}
+
+	// Call the API to delete the secret.
+	if err := client.DeleteSecret(ctx, deleteReq); err != nil {
+		return err // Handle the error appropriately.
 	}
 
 	return nil
