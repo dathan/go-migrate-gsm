@@ -22,11 +22,18 @@ func main() {
 	sourceProjectID := flag.String("srcpid", "", "source project id")
 	destProjectID := flag.String("dstpid", "", "destination project id")
 	deleteSrc := flag.Bool("delete", false, "backup and delete all the keys and values")
+	verifyEnv := flag.Bool("verify", false, "verify the src to ensure all values for each key exists")
 
 	flag.Parse()
 
 	// both flags are required
-	if len(*sourceProjectID) == 0 || len(*destProjectID) == 0 {
+	if len(*sourceProjectID) == 0 && len(*destProjectID) == 0 {
+		flag.Usage()
+		return
+	}
+
+	// if the destination is empty
+	if len(*destProjectID) == 0 && *verifyEnv == false || len(*sourceProjectID) == 0 {
 		flag.Usage()
 		return
 	}
@@ -56,7 +63,7 @@ func main() {
 
 	// Create secrets in the destination project with the same names
 	for _, secret := range srcSecrets {
-		logrus.Printf("Looking at secret %s in destination project", secret.Name)
+		//logrus.Printf("Looking at secret %s in destination project", secret.Name)
 		wg.Add(1)
 		semaphore <- struct{}{} // fill the channel and block
 		go func(ctx context.Context, client *secretmanager.Client, secret *secretmanagerpb.Secret) {
@@ -69,6 +76,15 @@ func main() {
 				return
 			}
 
+			if *verifyEnv == true {
+				if len(value) == 0 {
+					logrus.Warnf("The %s is missing its value restore please", secret.Name)
+					return
+				}
+				logrus.Infof("%s is ok - %d", secret.Name, len(value))
+				return
+			}
+
 			// backup and delete the secret
 			if *deleteSrc == true {
 				if err := deleteSecret(ctx, client, *sourceProjectID, *destProjectID, secret.Name, value, secret.Labels); err != nil {
@@ -76,7 +92,6 @@ func main() {
 				}
 				return
 			}
-
 			// create the secret
 			if err := createSecretWithValue(ctx, client, *destProjectID, secret.Name, value, secret.Labels); err != nil {
 				logrus.Errorf("failed to create secret: %v", err)
